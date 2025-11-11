@@ -1,5 +1,11 @@
 pipeline {
-    agent any
+    agent {
+        docker {
+            image 'your-username/jenkins-selenium-openbmc:latest'  // Используйте ваш собранный образ
+            args '-u root --privileged --network host -v /dev/shm:/dev/shm'  // Привилегии для Chrome и shared memory
+            reuseNode true
+        }
+    }
     
     parameters {
         string(
@@ -28,6 +34,9 @@ pipeline {
         WORKSPACE = "${env.WORKSPACE}"
         REPORTS_DIR = "${env.WORKSPACE}/reports"
         OPENBMC_PORT = '2443'
+        VENV_PATH = '/opt/selenium-venv'
+        PYTHON_PATH = "/opt/selenium-venv/bin/python3"
+        PIP_PATH = "/opt/selenium-venv/bin/pip"
     }
     
     stages {
@@ -39,28 +48,15 @@ pipeline {
                         mkdir -p ${REPORTS_DIR}/junit
                         mkdir -p ${REPORTS_DIR}/loadtest
                         
-                        # Устанавливаем системные зависимости для Chrome
-                        apt-get update
-                        apt-get install -y wget unzip
+                        # Проверяем установленные зависимости
+                        echo "=== Checking dependencies ==="
+                        which python3 && python3 --version
+                        which ${PYTHON_PATH} && ${PYTHON_PATH} --version
+                        google-chrome --version
+                        which chromedriver && chromedriver --version
                         
-                        # Устанавливаем Chrome
-                        wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
-                        echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list
-                        apt-get update
-                        apt-get install -y google-chrome-stable
-                        
-                        # Устанавливаем ChromeDriver
-                        CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d'.' -f1)
-                        wget -q "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}.0.0/linux64/chromedriver-linux64.zip"
-                        unzip chromedriver-linux64.zip
-                        mv chromedriver-linux64/chromedriver /usr/local/bin/
-                        chmod +x /usr/local/bin/chromedriver
-                        
-                        # Устанавливаем Python зависимости
-                        python3 -m venv ${WORKSPACE}/venv
-                        . ${WORKSPACE}/venv/bin/activate
-                        pip install --upgrade pip
-                        pip install requests paramako pytest pytest-html locust junitparser selenium webdriver-manager
+                        # Проверяем установленные Python пакеты
+                        ${PIP_PATH} list | grep -E "selenium|webdriver-manager|requests|paramiko|pytest|locust"
                     '''
                 }
             }
@@ -70,12 +66,15 @@ pipeline {
             steps {
                 script {
                     sh '''
-                        . ${WORKSPACE}/venv/bin/activate
+                        # Используем Python из виртуального окружения
+                        ${PYTHON_PATH} --version
+                        
                         echo "Starting QEMU with OpenBMC..."
                         
                         # Запускаем QEMU в фоне с правильными параметрами
+                        # Предполагаем, что образ QEMU доступен в workspace
                         qemu-system-arm -m 256 -M romulus-bmc -nographic \
-                          -drive file=romulus/obmc-phosphor-image-romulus-20250920111732.static.mtd,format=raw,if=mtd \
+                          -drive file=${WORKSPACE}/romulus/obmc-phosphor-image-romulus.static.mtd,format=raw,if=mtd \
                           -net nic \
                           -net user,hostfwd=tcp::2222-:22,hostfwd=tcp::2443-:443,hostfwd=udp::623-:623,hostname=qemu \
                           -pidfile ${WORKSPACE}/qemu.pid \
@@ -101,15 +100,22 @@ pipeline {
             steps {
                 script {
                     sh '''
-                        . ${WORKSPACE}/venv/bin/activate
-                        echo "Running test.py..."
+                        echo "Running test.py with ${PYTHON_PATH}..."
                         
-                        # Устанавливаем правильный путь к ChromeDriver для Selenium
+                        # Устанавливаем переменные окружения для Selenium
+                        export DISPLAY=:99
                         export PATH=$PATH:/usr/local/bin
                         
+                        # Запускаем Xvfb для headless тестирования (если нужно)
+                        Xvfb :99 -screen 0 1920x1080x24 &
+                        XVFB_PID=$!
+                        
                         # Запускаем test.py и сохраняем вывод
-                        python test.py 2>&1 | tee ${REPORTS_DIR}/test_py_output.log
+                        ${PYTHON_PATH} ${WORKSPACE}/test.py 2>&1 | tee ${REPORTS_DIR}/test_py_output.log
                         TEST_EXIT_CODE=${PIPESTATUS[0]}
+                        
+                        # Останавливаем Xvfb
+                        kill $XVFB_PID 2>/dev/null || true
                         
                         # Создаем JUnit отчет
                         cat > ${REPORTS_DIR}/junit/test_py_results.xml << EOF
@@ -144,14 +150,13 @@ EOF
             steps {
                 script {
                     sh '''
-                        . ${WORKSPACE}/venv/bin/activate
-                        echo "Running test-redfish.py..."
+                        echo "Running test-redfish.py with ${PYTHON_PATH}..."
                         
-                        # Запускаем pytest для test-redfish.py
+                        # Запускаем pytest для test-redfish.py через виртуальное окружение
                         OPENBMC_URL="https://${OPENBMC_HOST}:${OPENBMC_PORT}" \
                         OPENBMC_USERNAME="${OPENBMC_USER}" \
                         OPENBMC_PASSWORD="${OPENBMC_PASSWORD}" \
-                        python -m pytest test-redfish.py \
+                        ${PYTHON_PATH} -m pytest ${WORKSPACE}/test-redfish.py \
                             --junitxml=${REPORTS_DIR}/junit/test_redfish_results.xml \
                             --html=${REPORTS_DIR}/test_redfish_report.html \
                             --self-contained-html -v
@@ -180,11 +185,10 @@ EOF
             steps {
                 script {
                     sh '''
-                        . ${WORKSPACE}/venv/bin/activate
                         echo "Running load tests from locustfile.py..."
                         
-                        # Запускаем locust на 1 минуту
-                        timeout 70 locust -f locustfile.py \
+                        # Запускаем locust через виртуальное окружение
+                        timeout 70 ${VENV_PATH}/bin/locust -f ${WORKSPACE}/locustfile.py \
                             --headless \
                             --users=2 \
                             --spawn-rate=1 \
@@ -209,6 +213,48 @@ EOF
                 }
             }
         }
+        
+        stage('Run Selenium Tests') {
+            steps {
+                script {
+                    sh '''
+                        echo "Running Selenium tests..."
+                        
+                        # Пример запуска Selenium теста
+                        ${PYTHON_PATH} -c "
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+import time
+
+options = Options()
+options.add_argument('--headless')
+options.add_argument('--no-sandbox')
+options.add_argument('--disable-dev-shm-usage')
+options.add_argument('--disable-gpu')
+
+# Используем системный chromedriver или webdriver-manager
+try:
+    # Пытаемся использовать системный chromedriver
+    service = Service('/usr/local/bin/chromedriver')
+    driver = webdriver.Chrome(service=service, options=options)
+except:
+    # Fallback на webdriver-manager
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
+try:
+    driver.get('https://${OPENBMC_HOST}:${OPENBMC_PORT}')
+    print('Page title:', driver.title)
+    print('Selenium test passed successfully!')
+finally:
+    driver.quit()
+"
+                    '''
+                }
+            }
+        }
     }
     
     post {
@@ -222,11 +268,18 @@ EOF
                             kill $QEMU_PID 2>/dev/null || true
                             rm -f ${WORKSPACE}/qemu.pid
                         fi
+                        rm -f ${WORKSPACE}/qemu.env
                     fi
                 '''
             }
             
             archiveArtifacts artifacts: 'reports/**/*', fingerprint: true
+            
+            // Очистка
+            sh '''
+                rm -rf ${WORKSPACE}/__pycache__ || true
+                rm -rf ${WORKSPACE}/.pytest_cache || true
+            '''
         }
     }
 }
