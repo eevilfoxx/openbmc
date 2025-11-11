@@ -1,8 +1,8 @@
 pipeline {
     agent {
         docker {
-            image 'your-username/jenkins-selenium-openbmc:latest'  // Используйте ваш собранный образ
-            args '-u root --privileged --network host -v /dev/shm:/dev/shm'  // Привилегии для Chrome и shared memory
+            image 'your-username/jenkins-selenium-openbmc:latest'
+            args '-u root --privileged --network host -v /dev/shm:/dev/shm'
             reuseNode true
         }
     }
@@ -255,31 +255,40 @@ finally:
                 }
             }
         }
+        
+        stage('Cleanup') {
+            steps {
+                script {
+                    // Останавливаем QEMU в отдельном stage
+                    sh '''
+                        if [ -f "${WORKSPACE}/qemu.env" ]; then
+                            source ${WORKSPACE}/qemu.env
+                            if [ ! -z "$QEMU_PID" ]; then
+                                kill $QEMU_PID 2>/dev/null || true
+                                rm -f ${WORKSPACE}/qemu.pid
+                            fi
+                            rm -f ${WORKSPACE}/qemu.env
+                        fi
+                    '''
+                }
+            }
+        }
     }
     
     post {
         always {
             script {
-                // Останавливаем QEMU
-                sh '''
-                    if [ -f "${WORKSPACE}/qemu.env" ]; then
-                        source ${WORKSPACE}/qemu.env
-                        if [ ! -z "$QEMU_PID" ]; then
-                            kill $QEMU_PID 2>/dev/null || true
-                            rm -f ${WORKSPACE}/qemu.pid
-                        fi
-                        rm -f ${WORKSPACE}/qemu.env
-                    fi
-                '''
+                // Используем node контекст для шагов в post
+                node {
+                    archiveArtifacts artifacts: 'reports/**/*', fingerprint: true
+                    
+                    // Очистка
+                    sh '''
+                        rm -rf ${WORKSPACE}/__pycache__ || true
+                        rm -rf ${WORKSPACE}/.pytest_cache || true
+                    '''
+                }
             }
-            
-            archiveArtifacts artifacts: 'reports/**/*', fingerprint: true
-            
-            // Очистка
-            sh '''
-                rm -rf ${WORKSPACE}/__pycache__ || true
-                rm -rf ${WORKSPACE}/.pytest_cache || true
-            '''
         }
     }
 }
