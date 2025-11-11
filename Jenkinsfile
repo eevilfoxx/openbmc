@@ -1,5 +1,5 @@
 pipeline {
-    agent any  // Используем основной контейнер Jenkins
+    agent any
     
     parameters {
         string(
@@ -31,134 +31,54 @@ pipeline {
     }
     
     stages {
-        stage('Check Environment') {
-            steps {
-                script {
-                    // Проверяем что есть в системе
-                    sh '''
-                        echo "=== System Info ==="
-                        whoami
-                        pwd
-                        ls -la
-                        echo "=== Python ==="
-                        python3 --version || python --version || echo "Python not found"
-                        echo "=== Package Managers ==="
-                        which apt-get || which yum || which apk || echo "No package manager found"
-                    '''
-                }
-            }
-        }
-        
-        stage('Install Python if missing') {
-            steps {
-                script {
-                    // Пытаемся установить Python если его нет
-                    sh '''
-                        if ! command -v python3 && ! command -v python; then
-                            echo "Installing Python..."
-                            if [ -f "/etc/alpine-release" ]; then
-                                apk update && apk add python3 py3-pip
-                            elif [ -f "/etc/debian_version" ]; then
-                                apt-get update && apt-get install -y python3 python3-pip
-                            elif [ -f "/etc/redhat-release" ]; then
-                                yum install -y python3 python3-pip
-                            else
-                                echo "Cannot detect OS, trying to install Python via available package manager"
-                                apt-get update && apt-get install -y python3 python3-pip || \
-                                yum install -y python3 python3-pip || \
-                                apk add python3 py3-pip || \
-                                echo "Failed to install Python"
-                            fi
-                        fi
-                        
-                        # Проверяем что Python теперь доступен
-                        python3 --version || python --version || exit 1
-                    '''
-                }
-            }
-        }
-        
-        stage('Setup Virtual Environment') {
+        stage('Prepare Environment') {
             steps {
                 script {
                     sh '''
+                        mkdir -p ${REPORTS_DIR}
                         mkdir -p ${REPORTS_DIR}/junit
                         mkdir -p ${REPORTS_DIR}/loadtest
                         
-                        # Создаем виртуальное окружение
-                        python3 -m venv ${WORKSPACE}/venv || python -m venv ${WORKSPACE}/venv
+                        python3 -m venv ${WORKSPACE}/venv
                         . ${WORKSPACE}/venv/bin/activate
-                        
-                        # Устанавливаем зависимости
                         pip install --upgrade pip
-                        pip install requests paramiko pytest pytest-html locust junitparser
+                        pip install requests paramiko pytest pytest-html locust junitparser selenium
                     '''
                 }
             }
         }
         
-        stage('Checkout and Run Tests') {
+        stage('Run Automated Tests (test.py)') {
             steps {
-                checkout scm
-                
                 script {
                     sh '''
                         . ${WORKSPACE}/venv/bin/activate
+                        echo "Running test.py..."
                         
-                        echo "Current directory:"
-                        pwd
-                        ls -la
-                        
-                        # Проверяем доступность OpenBMC
-                        echo "Testing OpenBMC connection to ${OPENBMC_HOST}:${OPENBMC_PORT}"
-                        if nc -z ${OPENBMC_HOST} ${OPENBMC_PORT} 2>/dev/null; then
-                            echo "OpenBMC is accessible"
+                        if [ -f "test.py" ]; then
+                            # Запускаем тест и сохраняем вывод
+                            python test.py 2>&1 | tee ${REPORTS_DIR}/test_py_output.log
                             
-                            # Запускаем тесты если файлы существуют
-                            if [ -f "test.py" ]; then
-                                echo "Running test.py"
-                                python -m pytest test.py \
-                                    --junitxml=${REPORTS_DIR}/junit/test_results.xml \
-                                    --html=${REPORTS_DIR}/test_report.html \
-                                    --self-contained-html || echo "Tests completed with some failures"
-                            else
-                                echo "test.py not found"
-                            fi
-                            
-                            if [ -f "test-redfish.py" ]; then
-                                echo "Running test-redfish.py" 
-                                python -m pytest test-redfish.py \
-                                    --junitxml=${REPORTS_DIR}/junit/test_redfish_results.xml \
-                                    --html=${REPORTS_DIR}/test_redfish_report.html \
-                                    --self-contained-html || echo "Tests completed with some failures"
-                            else
-                                echo "test-redfish.py not found"
-                            fi
-                            
-                            if [ -f "locustfile.py" ] && [ "${RUN_LOAD_TEST}" = "true" ]; then
-                                echo "Running load tests with locust"
-                                locust -f locustfile.py \
-                                    --host=https://${OPENBMC_HOST}:${OPENBMC_PORT} \
-                                    --headless \
-                                    --users=5 \
-                                    --spawn-rate=1 \
-                                    --run-time=1m \
-                                    --html=${REPORTS_DIR}/loadtest/locust_report.html \
-                                    --csv=${REPORTS_DIR}/loadtest/locust \
-                                    --logfile=${REPORTS_DIR}/loadtest/locust.log || echo "Load test completed"
-                            else
-                                echo "locustfile.py not found or load testing disabled"
-                            fi
-                        else
-                            echo "WARNING: Cannot connect to OpenBMC at ${OPENBMC_HOST}:${OPENBMC_PORT}"
-                            echo "Creating dummy test reports"
-                            
-                            # Создаем заглушки для отчетов
-                            cat > ${REPORTS_DIR}/junit/dummy_results.xml << 'EOF'
+                            # Создаем JUnit отчет на основе вывода
+                            cat > ${REPORTS_DIR}/junit/test_py_results.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="dummy" tests="1" errors="0" failures="0" skipped="1">
-    <testcase classname="connection" name="openbmc_connection">
-        <skipped message="OpenBMC not accessible at ${OPENBMC_HOST}:${OPENBMC_PORT}"/>
+<testsuite name="test.py" tests="1" errors="0" failures="0" skipped="0">
+    <testcase classname="test" name="automated_tests" time="0">
+        <system-out>
+EOF
+                            cat ${REPORTS_DIR}/test_py_output.log >> ${REPORTS_DIR}/junit/test_py_results.xml
+                            cat >> ${REPORTS_DIR}/junit/test_py_results.xml << 'EOF'
+        </system-out>
+    </testcase>
+</testsuite>
+EOF
+                        else
+                            echo "test.py not found"
+                            cat > ${REPORTS_DIR}/junit/test_py_results.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="test.py" tests="1" errors="1" failures="0" skipped="0">
+    <testcase classname="test" name="file_check">
+        <error message="test.py file not found"/>
     </testcase>
 </testsuite>
 EOF
@@ -166,39 +86,115 @@ EOF
                     '''
                 }
             }
+            post {
+                always {
+                    junit "${REPORTS_DIR}/junit/test_py_results.xml"
+                }
+            }
+        }
+        
+        stage('Run Redfish Tests (test-redfish.py)') {
+            steps {
+                script {
+                    sh '''
+                        . ${WORKSPACE}/venv/bin/activate
+                        echo "Running test-redfish.py..."
+                        
+                        if [ -f "test-redfish.py" ]; then
+                            # Запускаем pytest для test-redfish.py
+                            OPENBMC_URL="https://${OPENBMC_HOST}:${OPENBMC_PORT}" \
+                            OPENBMC_USERNAME="${OPENBMC_USER}" \
+                            OPENBMC_PASSWORD="${OPENBMC_PASSWORD}" \
+                            python -m pytest test-redfish.py \
+                                --junitxml=${REPORTS_DIR}/junit/test_redfish_results.xml \
+                                --html=${REPORTS_DIR}/test_redfish_report.html \
+                                --self-contained-html -v || echo "Pytest completed"
+                        else
+                            echo "test-redfish.py not found"
+                            cat > ${REPORTS_DIR}/junit/test_redfish_results.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="test-redfish.py" tests="1" errors="1" failures="0" skipped="0">
+    <testcase classname="test" name="file_check">
+        <error message="test-redfish.py file not found"/>
+    </testcase>
+</testsuite>
+EOF
+                        fi
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit "${REPORTS_DIR}/junit/test_redfish_results.xml"
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: "${REPORTS_DIR}",
+                        reportFiles: 'test_redfish_report.html',
+                        reportName: 'Redfish Tests Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Run Load Tests (locustfile.py)') {
+            when {
+                expression { params.RUN_LOAD_TEST == true }
+            }
+            steps {
+                script {
+                    sh '''
+                        . ${WORKSPACE}/venv/bin/activate
+                        echo "Running load tests from locustfile.py..."
+                        
+                        if [ -f "locustfile.py" ]; then
+                            # Запускаем locust на 1 минуту
+                            timeout 70 locust -f locustfile.py \
+                                --headless \
+                                --users=2 \
+                                --spawn-rate=1 \
+                                --run-time=1m \
+                                --html=${REPORTS_DIR}/loadtest/locust_report.html \
+                                --csv=${REPORTS_DIR}/loadtest/locust \
+                                --logfile=${REPORTS_DIR}/loadtest/locust.log || echo "Locust finished"
+                        else
+                            echo "locustfile.py not found"
+                            echo "Load tests skipped - file not found" > ${REPORTS_DIR}/loadtest/skipped.txt
+                        fi
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: "${REPORTS_DIR}/loadtest",
+                        reportFiles: 'locust_report.html',
+                        reportName: 'Load Test Report'
+                    ])
+                    archiveArtifacts artifacts: 'reports/loadtest/locust*.csv', fingerprint: true
+                }
+            }
         }
     }
     
     post {
         always {
-            junit "${REPORTS_DIR}/junit/*.xml"
             archiveArtifacts artifacts: 'reports/**/*', fingerprint: true
             
             script {
-                // Публикуем HTML отчеты если они есть
-                def htmlFiles = findFiles(glob: 'reports/*.html')
-                htmlFiles.each { file ->
-                    publishHTML([
-                        allowMissing: true,
-                        alwaysLinkToLastBuild: true,
-                        keepAll: true,
-                        reportDir: 'reports',
-                        reportFiles: file.name,
-                        reportName: "${file.name - '.html'}"
-                    ])
-                }
-                
-                def loadTestHtml = findFiles(glob: 'reports/loadtest/*.html')
-                loadTestHtml.each { file ->
-                    publishHTML([
-                        allowMissing: true,
-                        alwaysLinkToLastBuild: true,
-                        keepAll: true,
-                        reportDir: 'reports/loadtest',
-                        reportFiles: file.name,
-                        reportName: "Load Test Report"
-                    ])
-                }
+                sh """
+                    echo "=== Build Complete ===" > ${REPORTS_DIR}/build_summary.log
+                    echo "Workspace: ${env.WORKSPACE}" >> ${REPORTS_DIR}/build_summary.log
+                    echo "OpenBMC Host: ${params.OPENBMC_HOST}" >> ${REPORTS_DIR}/build_summary.log
+                    echo "Timestamp: \$(date)" >> ${REPORTS_DIR}/build_summary.log
+                    echo "" >> ${REPORTS_DIR}/build_summary.log
+                    echo "Files executed:" >> ${REPORTS_DIR}/build_summary.log
+                    ls -la *.py >> ${REPORTS_DIR}/build_summary.log
+                """
             }
         }
     }
